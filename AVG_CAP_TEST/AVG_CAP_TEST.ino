@@ -10,9 +10,9 @@
 // =============================
 // USER PINS
 // =============================
-static const int BUTTON_PIN            = 27; // Active-LOW button to GND, uses INPUT_PULLUP
-static const int LED_POWER_RED_PIN     = 25; // Red LED (power)
-static const int LED_STABLE_GRN_PIN    = 26; // Green LED (stable)
+static const int BUTTON_PIN             = 27; // Active-LOW button to GND, uses INPUT_PULLUP
+static const int LED_POWER_RED_PIN      = 25; // Red LED (power)
+static const int LED_STABLE_GRN_PIN     = 26; // Green LED (stable)
 static const int LED_MEASURE_ORANGE_PIN = 14; // Orange LED (measuring mode)
 
 // =============================
@@ -21,7 +21,7 @@ static const int LED_MEASURE_ORANGE_PIN = 14; // Orange LED (measuring mode)
 static const int I2C_SDA = 21;
 static const int I2C_SCL = 22;
 
-const uint8_t  NUM_CHANNELS = 4;
+const uint8_t  NUM_CHANNELS         = 4;
 const uint16_t MEASUREMENT_DELAY_MS = 500;
 
 FDC1004 capacitanceSensor(&Wire1, FDC1004_RATE_100HZ);
@@ -29,19 +29,26 @@ FDC1004 capacitanceSensor(&Wire1, FDC1004_RATE_100HZ);
 // =============================
 // Filtering / Stability Settings
 // =============================
-const uint8_t MEDIAN_WIN = 5;
-const float   STABLE_SPREAD_PF = 0.80f;
+const uint8_t MEDIAN_WIN         = 5;
+const float   STABLE_SPREAD_PF   = 0.80f; // first-layer differential stability
+const float   VALUE_SPREAD_PF    = 0.30f; // second-layer corrected-value stability
 
-// Rolling median windows per channel (real capacitance pF)
+// Rolling median windows per channel (raw capacitance in pF)
 static float   chWin[NUM_CHANNELS][MEDIAN_WIN];
 static uint8_t chCount[NUM_CHANNELS] = {0};
 static uint8_t chIdx[NUM_CHANNELS]   = {0};
 
-// Differential windows used ONLY for stability checking
+// Differential windows used ONLY for first-layer electrical stability checking
 static float   ide1DiffWin[MEDIAN_WIN];
 static float   ide2DiffWin[MEDIAN_WIN];
 static uint8_t ide1DiffCount = 0, ide1DiffIdx = 0;
 static uint8_t ide2DiffCount = 0, ide2DiffIdx = 0;
+
+// Baseline-corrected TRUE capacitance windows used for second-layer value stability
+static float   ide1CalWin[MEDIAN_WIN];
+static float   ide2CalWin[MEDIAN_WIN];
+static uint8_t ide1CalCount = 0, ide1CalIdx = 0;
+static uint8_t ide2CalCount = 0, ide2CalIdx = 0;
 
 // =============================
 // Session settings
@@ -84,21 +91,46 @@ static uint16_t gSeq = 0;
 // =============================
 // State machine
 // =============================
-enum State { ST_IDLE, ST_MEASURING };
-static State state = ST_IDLE;
+enum State {
+  ST_CALIBRATING,
+  ST_IDLE,
+  ST_MEASURING
+};
+static State state = ST_CALIBRATING;
 
 static uint32_t sessionStartMs = 0;
-static uint32_t lastTickMs = 0;
-static uint32_t stableAccumMs = 0;   // cumulative stable time
-static uint32_t stableRunMs   = 0;   // current continuous stable run (debug only)
+static uint32_t lastTickMs     = 0;
+static uint32_t stableAccumMs  = 0; // cumulative stable time
+static uint32_t stableRunMs    = 0; // current continuous stable run (debug only)
 
 // =============================
 // Stable-only accumulators for FINAL summary
+// These store baseline-corrected values gathered only while stable.
 // =============================
 static double ide1StableSum = 0.0;
 static double ide2StableSum = 0.0;
 static uint16_t ide1StableSamples = 0;
 static uint16_t ide2StableSamples = 0;
+
+// =============================
+// Startup calibration
+// On boot, measure open-air capacitance for 5 seconds and store
+// that average as the baseline to subtract from reported readings.
+// =============================
+static const uint32_t CALIBRATION_TIME_MS = 5000;
+
+static uint32_t calibrationStartMs = 0;
+
+// Baseline of TRUE capacitance (not differential)
+static double ide1BaselineSum = 0.0;
+static double ide2BaselineSum = 0.0;
+static uint16_t ide1BaselineSamples = 0;
+static uint16_t ide2BaselineSamples = 0;
+
+static float ide1BaselinePf = 0.0f;
+static float ide2BaselinePf = 0.0f;
+
+static bool baselineReady = false;
 
 // =============================
 // Callbacks
@@ -178,10 +210,140 @@ static void clearWindows()
 
   ide1DiffCount = ide1DiffIdx = 0;
   ide2DiffCount = ide2DiffIdx = 0;
+  ide1CalCount = ide1CalIdx = 0;
+  ide2CalCount = ide2CalIdx = 0;
+
   for (uint8_t i = 0; i < MEDIAN_WIN; i++) {
     ide1DiffWin[i] = 0.0f;
     ide2DiffWin[i] = 0.0f;
+    ide1CalWin[i] = 0.0f;
+    ide2CalWin[i] = 0.0f;
   }
+}
+
+static void resetCalibration()
+{
+  // Reset timing and accumulators used during startup calibration.
+  calibrationStartMs = 0;
+
+  // Running sums used to compute the average open-air baseline.
+  ide1BaselineSum = 0.0;
+  ide2BaselineSum = 0.0;
+
+  // Number of valid samples collected for each IDE pair.
+  ide1BaselineSamples = 0;
+  ide2BaselineSamples = 0;
+
+  // Final computed baseline values in pF.
+  ide1BaselinePf = 0.0f;
+  ide2BaselinePf = 0.0f;
+
+  // This becomes true once the calibration window completes.
+  baselineReady = false;
+
+  // Clear rolling windows so calibration starts from a clean state.
+  clearWindows();
+}
+
+static bool calibrationTickAndFinish(uint32_t nowMs)
+{
+  // ------------------------------------------------------------
+  // Startup calibration phase:
+  // For 5 seconds after power-up, measure the electrodes in
+  // open-air condition and compute the baseline capacitance.
+  //
+  // This baseline is later subtracted from IDE1 / IDE2 TRUE
+  // capacitance so Flutter receives baseline-corrected values.
+  // ------------------------------------------------------------
+
+  // Step 1: Read CH0..CH3 and update rolling windows.
+  for (uint8_t ch = 0; ch < NUM_CHANNELS; ch++) {
+    fdc1004_capacitance_t m =
+        capacitanceSensor.getCapacitanceMeasurement((fdc1004_channel_t)ch);
+
+    if (!isnan(m.capacitance_pf)) {
+      pushSample(chWin[ch], chCount[ch], chIdx[ch], m.capacitance_pf);
+    }
+
+    delay(10);
+  }
+
+  // Step 2: Compute median-filtered capacitance for each channel.
+  float chMed[NUM_CHANNELS];
+  bool chValid[NUM_CHANNELS];
+
+  for (uint8_t ch = 0; ch < NUM_CHANNELS; ch++) {
+    chMed[ch] = medianOf(chWin[ch], chCount[ch]);
+    chValid[ch] = !isnan(chMed[ch]);
+  }
+
+  // Step 3: Compute TRUE capacitance for each IDE pair.
+  // IDE1 = average(CH0, CH1)
+  // IDE2 = average(CH2, CH3)
+  const bool ide1TrueValid = chValid[0] && chValid[1];
+  const bool ide2TrueValid = chValid[2] && chValid[3];
+
+  const float ide1True =
+      ide1TrueValid ? (0.5f * (chMed[0] + chMed[1])) : NAN;
+  const float ide2True =
+      ide2TrueValid ? (0.5f * (chMed[2] + chMed[3])) : NAN;
+
+  // Step 4: Accumulate raw TRUE capacitance values into baseline sums.
+  if (ide1TrueValid) {
+    ide1BaselineSum += (double)ide1True;
+    ide1BaselineSamples++;
+  }
+
+  if (ide2TrueValid) {
+    ide2BaselineSum += (double)ide2True;
+    ide2BaselineSamples++;
+  }
+
+  // Step 5: Print calibration progress for serial debugging.
+  Serial.print("[CAL] IDE1_RAW=");
+  if (ide1TrueValid) {
+    Serial.print(ide1True, 3);
+  } else {
+    Serial.print("ERR");
+  }
+
+  Serial.print("\tIDE2_RAW=");
+  if (ide2TrueValid) {
+    Serial.print(ide2True, 3);
+  } else {
+    Serial.print("ERR");
+  }
+
+  Serial.print("\telapsedMs=");
+  Serial.println(nowMs - calibrationStartMs);
+
+  // Step 6: Finish calibration once the 5-second window has elapsed.
+  if ((nowMs - calibrationStartMs) >= CALIBRATION_TIME_MS) {
+    if (ide1BaselineSamples > 0) {
+      ide1BaselinePf =
+          (float)(ide1BaselineSum / (double)ide1BaselineSamples);
+    }
+
+    if (ide2BaselineSamples > 0) {
+      ide2BaselinePf =
+          (float)(ide2BaselineSum / (double)ide2BaselineSamples);
+    }
+
+    baselineReady = (ide1BaselineSamples > 0) || (ide2BaselineSamples > 0);
+
+    Serial.println("== CALIBRATION COMPLETE ==");
+    Serial.print("IDE1 baseline pF = ");
+    Serial.println(ide1BaselinePf, 3);
+    Serial.print("IDE2 baseline pF = ");
+    Serial.println(ide2BaselinePf, 3);
+
+    // Clear windows so the actual measurement session starts fresh.
+    clearWindows();
+    return true;
+  }
+
+  // Calibration still in progress.
+  return false;
 }
 
 static void resetSessionStats()
@@ -249,10 +411,10 @@ static void sendPacket(float ide1Pf, bool ide1Valid,
   if (clamped)      flags |= FLAG_CLAMPED;
 
   ide_packet_t pkt;
-  pkt.seq = gSeq++;
+  pkt.seq      = gSeq++;
   pkt.ide1_mpF = ide1_mpF;
   pkt.ide2_mpF = ide2_mpF;
-  pkt.flags = flags;
+  pkt.flags    = flags;
 
   if (gDeviceConnected && gPktChr) {
     gPktChr->setValue((uint8_t*)&pkt, sizeof(pkt));
@@ -292,13 +454,13 @@ static void setupBle()
 // =============================
 // One measurement tick
 // - Differential is used ONLY for stability
-// - True capacitance is sent to Flutter
+// - TRUE capacitance is baseline-corrected for reporting
 // - Stable sample packets are notified on every stable tick
-// - FINAL packet sent once on success or timeout
+// - FINAL packet is sent once on success or timeout
 // =============================
 static bool measurementTickAndMaybeFinish(uint32_t nowMs)
 {
-  // Read CH0..CH3 and update rolling windows
+  // Step 1: Read CH0..CH3 and update rolling windows.
   for (uint8_t ch = 0; ch < NUM_CHANNELS; ch++) {
     fdc1004_capacitance_t m =
         capacitanceSensor.getCapacitanceMeasurement((fdc1004_channel_t)ch);
@@ -309,7 +471,7 @@ static bool measurementTickAndMaybeFinish(uint32_t nowMs)
     delay(10);
   }
 
-  // Median-filtered real capacitance per channel
+  // Step 2: Compute median-filtered raw capacitance for each channel.
   float chMed[NUM_CHANNELS];
   bool  chValid[NUM_CHANNELS];
 
@@ -318,14 +480,19 @@ static bool measurementTickAndMaybeFinish(uint32_t nowMs)
     chValid[ch] = !isnan(chMed[ch]);
   }
 
-  // True capacitance values for reporting / packets
+  // Step 3: Compute TRUE capacitance values for IDE1 and IDE2.
   const bool ide1TrueValid = chValid[0] && chValid[1];
   const bool ide2TrueValid = chValid[2] && chValid[3];
 
   const float ide1True = ide1TrueValid ? (0.5f * (chMed[0] + chMed[1])) : NAN;
   const float ide2True = ide2TrueValid ? (0.5f * (chMed[2] + chMed[3])) : NAN;
 
-  // Differential values ONLY for stability
+  // Step 4: Subtract the startup baseline so the reported values represent
+  // capacitance above the open-air/base level.
+  const float ide1Cal = ide1TrueValid ? (ide1True - ide1BaselinePf) : NAN;
+  const float ide2Cal = ide2TrueValid ? (ide2True - ide2BaselinePf) : NAN;
+
+  // Step 5: Compute pseudo-differential values used for first-layer electrical stability.
   const bool ide1DiffValid = ide1TrueValid;
   const bool ide2DiffValid = ide2TrueValid;
 
@@ -335,33 +502,45 @@ static bool measurementTickAndMaybeFinish(uint32_t nowMs)
   if (ide1DiffValid) pushSample(ide1DiffWin, ide1DiffCount, ide1DiffIdx, ide1Diff);
   if (ide2DiffValid) pushSample(ide2DiffWin, ide2DiffCount, ide2DiffIdx, ide2Diff);
 
-  const bool stable1 = ide1DiffValid && isStableSpread(ide1DiffWin, ide1DiffCount, STABLE_SPREAD_PF);
-  const bool stable2 = ide2DiffValid && isStableSpread(ide2DiffWin, ide2DiffCount, STABLE_SPREAD_PF);
-  const bool stableNow = stable1 && stable2;
+  // Step 6: Store baseline-corrected TRUE capacitance for second-layer value stability.
+  if (ide1TrueValid) pushSample(ide1CalWin, ide1CalCount, ide1CalIdx, ide1Cal);
+  if (ide2TrueValid) pushSample(ide2CalWin, ide2CalCount, ide2CalIdx, ide2Cal);
 
+  // Layer 1: differential/electrical stability
+  const bool diffStable1 = ide1DiffValid && isStableSpread(ide1DiffWin, ide1DiffCount, STABLE_SPREAD_PF);
+  const bool diffStable2 = ide2DiffValid && isStableSpread(ide2DiffWin, ide2DiffCount, STABLE_SPREAD_PF);
+
+  // Layer 2: corrected-value stability
+  const bool valueStable1 = ide1TrueValid && isStableSpread(ide1CalWin, ide1CalCount, VALUE_SPREAD_PF);
+  const bool valueStable2 = ide2TrueValid && isStableSpread(ide2CalWin, ide2CalCount, VALUE_SPREAD_PF);
+
+  // Final acceptance requires both layers to pass for both IDE pairs.
+  const bool stableNow = diffStable1 && diffStable2 && valueStable1 && valueStable2;
+
+  // Green LED mirrors the final, third-layer acceptance decision.
   ledWrite(LED_STABLE_GRN_PIN, stableNow);
 
-  // Accurate dt per tick
+  // Accurate dt per tick.
   uint32_t dt = (lastTickMs == 0) ? MEASUREMENT_DELAY_MS : (nowMs - lastTickMs);
   lastTickMs = nowMs;
 
-  // Track cumulative stable time and current continuous run
+  // Step 7: If final stability is achieved, accumulate stable time and collect
+  // baseline-corrected values that will later be averaged into the FINAL packet.
   if (stableNow) {
     stableAccumMs += dt;
     stableRunMs += dt;
 
-    // accumulate stable-only averages for FINAL summary
     if (ide1TrueValid) {
-      ide1StableSum += (double)ide1True;
+      ide1StableSum += (double)ide1Cal;
       ide1StableSamples++;
     }
     if (ide2TrueValid) {
-      ide2StableSum += (double)ide2True;
+      ide2StableSum += (double)ide2Cal;
       ide2StableSamples++;
     }
 
-    // send stable sample packet on every stable tick
-    sendPacket(ide1True, ide1TrueValid, ide2True, ide2TrueValid,
+    // Send a live packet on every stable tick.
+    sendPacket(ide1Cal, ide1TrueValid, ide2Cal, ide2TrueValid,
                true, false, false);
   } else {
     stableRunMs = 0;
@@ -369,9 +548,9 @@ static bool measurementTickAndMaybeFinish(uint32_t nowMs)
 
   const uint32_t elapsed = nowMs - sessionStartMs;
   const bool sessionValid = (stableAccumMs >= REQUIRED_STABLE_ACCUM_MS);
-  const bool timedOut = (elapsed >= SESSION_TIMEOUT_MS);
+  const bool timedOut     = (elapsed >= SESSION_TIMEOUT_MS);
 
-  // Debug serial
+  // Debug serial output.
   Serial.print("CH0=");
   if (chValid[0]) Serial.print(chMed[0], 3); else Serial.print("ERR");
   Serial.print("\tCH1=");
@@ -381,10 +560,10 @@ static bool measurementTickAndMaybeFinish(uint32_t nowMs)
   Serial.print("\tCH3=");
   if (chValid[3]) Serial.print(chMed[3], 3); else Serial.print("ERR");
 
-  Serial.print("\tIDE1_TRUE=");
-  if (ide1TrueValid) Serial.print(ide1True, 3); else Serial.print("ERR");
-  Serial.print("\tIDE2_TRUE=");
-  if (ide2TrueValid) Serial.print(ide2True, 3); else Serial.print("ERR");
+  Serial.print("\tIDE1_CAL=");
+  if (ide1TrueValid) Serial.print(ide1Cal, 3); else Serial.print("ERR");
+  Serial.print("\tIDE2_CAL=");
+  if (ide2TrueValid) Serial.print(ide2Cal, 3); else Serial.print("ERR");
 
   Serial.print("\tstableNow=");
   Serial.print(stableNow ? 1 : 0);
@@ -395,15 +574,15 @@ static bool measurementTickAndMaybeFinish(uint32_t nowMs)
   Serial.print("\telapsedMs=");
   Serial.println(elapsed);
 
-  // Finish if enough stable time accumulated OR timeout
+  // Step 7: Finish if enough stable time has accumulated OR timeout occurs.
   if (sessionValid || timedOut) {
-    // FINAL packet carries stable-only average summary
     bool ide1AvgValid = (ide1StableSamples > 0);
     bool ide2AvgValid = (ide2StableSamples > 0);
 
     float ide1Avg = ide1AvgValid ? (float)(ide1StableSum / (double)ide1StableSamples) : NAN;
     float ide2Avg = ide2AvgValid ? (float)(ide2StableSum / (double)ide2StableSamples) : NAN;
 
+    // FINAL packet carries the stable-only average summary.
     sendPacket(ide1Avg, ide1AvgValid, ide2Avg, ide2AvgValid,
                stableNow, sessionValid, true);
 
@@ -439,7 +618,6 @@ void setup()
   Wire1.setPins(I2C_SDA, I2C_SCL);
 
   Serial.println("FDC1004 BLE Flow: button-start, stable sample notify, FINAL notify");
-  Serial.println("Press ESP32 button to start measurement session.");
 
   if (!capacitanceSensor.begin()) {
     Serial.println("✗ FDC1004 init failed");
@@ -453,12 +631,47 @@ void setup()
 
   setupBle();
 
-  state = ST_IDLE;
+  // Start the device in calibration mode so open-air baseline is measured
+  // before any user measurement sessions are allowed.
+  resetCalibration();
+  calibrationStartMs = millis();
+  state = ST_CALIBRATING;
+
+  Serial.println("== STARTUP CALIBRATION ==");
+  Serial.println("Keep electrodes in open air for 5 seconds...");
 }
 
 void loop()
 {
-  // Start session from physical button only when idle
+  // ------------------------------------------------------------
+  // STATE: CALIBRATING
+  // On power-up, spend 5 seconds measuring the electrode baseline
+  // in open air before allowing sessions.
+  // ------------------------------------------------------------
+  if (state == ST_CALIBRATING) {
+    ledWrite(LED_POWER_RED_PIN, true);
+    ledWrite(LED_STABLE_GRN_PIN, false);
+    ledWrite(LED_MEASURE_ORANGE_PIN, false);
+
+    static uint32_t lastCalibrationTickMs = 0;
+    const uint32_t now = millis();
+
+    if (now - lastCalibrationTickMs >= MEASUREMENT_DELAY_MS) {
+      lastCalibrationTickMs = now;
+
+      const bool done = calibrationTickAndFinish(now);
+      if (done) {
+        state = ST_IDLE;
+
+        Serial.println("== DEVICE READY ==");
+        Serial.println("Press button to start measurement session.\n");
+      }
+    }
+
+    return;
+  }
+
+  // Start session from physical button only when idle.
   if (state == ST_IDLE && buttonPressedEvent()) {
     clearWindows();
     resetSessionStats();
@@ -472,14 +685,15 @@ void loop()
   }
 
   if (state == ST_IDLE) {
-    // True idle: no sampling, no notify, green LED off
+    // True idle: no sampling, no notifications, green/orange LEDs off.
     ledWrite(LED_STABLE_GRN_PIN, false);
     ledWrite(LED_MEASURE_ORANGE_PIN, false);
     delay(50);
     return;
   }
 
-  // Measuring tick
+  // STATE: MEASURING
+  // Run one measurement tick every 500 ms.
   static uint32_t lastScheduleMs = 0;
   const uint32_t now = millis();
 
