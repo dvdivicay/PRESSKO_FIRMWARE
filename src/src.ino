@@ -10,13 +10,13 @@
 // =============================
 // USER PINS
 // =============================
-static const int BUTTON_PIN             = 27; // Active-LOW button to GND, uses INPUT_PULLUP
-static const int LED_POWER_RED_PIN      = 15; // Red LED (power)
-static const int LED_STABILITY_PIN     = 2; // Green LED (stable)
-static const int LED_MEASURING_PIN      = 12; // Orange LED (measuring mode)
-static const int LED_CLASS_FRESH_PIN      = 0; // AI model Classification (Fresh)
-static const int LED_CLASS_MODERATE_PIN      = 4; // AI model Classification (Moderately Fresh)
-static const int LED_CLASS_SPOILED_PIN      = 16; // AI model Classification (Spoiled)
+static const int BUTTON_PIN                = 27; // Active-LOW button to GND, uses INPUT_PULLUP
+static const int LED_POWER_RED_PIN         = 15; // Red LED (power)
+static const int LED_STABILITY_PIN         = 2;  // Green LED (stable / accepted)
+static const int LED_MEASURING_PIN         = 12; // Orange LED (measuring mode)
+static const int LED_CLASS_FRESH_PIN       = 0;  // Reserved for Flutter AI classification (Fresh)
+static const int LED_CLASS_MODERATE_PIN    = 4;  // Reserved for Flutter AI classification (Moderately Fresh)
+static const int LED_CLASS_SPOILED_PIN     = 16; // Reserved for Flutter AI classification (Spoiled)
 
 // =============================
 // I2C + Sensor
@@ -32,9 +32,18 @@ FDC1004 capacitanceSensor(&Wire1, FDC1004_RATE_100HZ);
 // =============================
 // Filtering / Stability Settings
 // =============================
-const uint8_t MEDIAN_WIN         = 5;
-const float   STABLE_SPREAD_PF   = 0.80f; // first-layer differential stability
-const float   VALUE_SPREAD_PF    = 0.30f; // second-layer corrected-value stability
+const uint8_t MEDIAN_WIN       = 5;
+const float   STABLE_SPREAD_PF = 0.80f; // first-layer differential stability
+const float   VALUE_SPREAD_PF  = 0.30f; // second-layer corrected-value stability
+
+// Better lock qualification / contact confirmation
+static const float    CONTACT_MIN_PF_IDE1 = 0.80f; // TODO: validate experimentally
+static const float    CONTACT_MIN_PF_IDE2 = 0.80f; // TODO: validate experimentally
+static const uint32_t LOCK_STABLE_HOLD_MS = 2000;  // locally stable + contact-qualified before lock
+static const float    REFERENCE_TOL_PF    = 0.50f;
+
+// Threshold validation instrumentation
+static const uint16_t CONTACT_REJECT_LOG_INTERVAL = 4; // print every N rejected ticks to reduce spam
 
 // Rolling median windows per channel (raw capacitance in pF)
 static float   chWin[NUM_CHANNELS][MEDIAN_WIN];
@@ -56,8 +65,9 @@ static uint8_t ide2CalCount = 0, ide2CalIdx = 0;
 // =============================
 // Session settings
 // =============================
-static const uint32_t REQUIRED_STABLE_ACCUM_MS = 5000;  // 5 seconds cumulative stable
+static const uint32_t REQUIRED_STABLE_ACCUM_MS = 5000;  // 5 seconds cumulative accepted stable
 static const uint32_t SESSION_TIMEOUT_MS       = 20000; // 20 seconds timeout
+static const uint32_t CONTACT_DETECT_TIMEOUT_MS = 7000; // fail early if no valid fish contact is found
 
 // =============================
 // BLE GATT Settings
@@ -88,37 +98,61 @@ static_assert(sizeof(ide_packet_t) == 7, "ide_packet_t must be 7 bytes");
 // =============================
 static BLEServer         *gServer = nullptr;
 static BLECharacteristic *gPktChr = nullptr;
+static BLEAdvertising    *gAdvertising = nullptr;
 static bool gDeviceConnected = false;
+static bool gAdvertisingActive = false;
+static uint32_t lastAdvertiseAttemptMs = 0;
 static uint16_t gSeq = 0;
 
 // =============================
-// State machine
+// State machine / failure reasons
 // =============================
 enum State {
   ST_CALIBRATING,
   ST_IDLE,
-  ST_MEASURING
+  ST_CONTACT_DETECTING,
+  ST_REFERENCE_LOCKING,
+  ST_MEASURING_VALID,
+  ST_INVALIDATED
 };
+
 static State state = ST_CALIBRATING;
 
-static uint32_t sessionStartMs = 0;
-static uint32_t lastTickMs     = 0;
-static uint32_t stableAccumMs  = 0; // cumulative stable time
-static uint32_t stableRunMs    = 0; // current continuous stable run (debug only)
+enum FailureReason {
+  FAIL_NONE,
+  FAIL_TIMEOUT_NO_CONTACT,
+  FAIL_TIMEOUT_UNSTABLE,
+  FAIL_CONTINUITY_BROKEN,
+  FAIL_SENSOR_INVALID,
+  FAIL_BLE_DISCONNECTED
+};
+
+static FailureReason lastFailureReason = FAIL_NONE;
+
+static uint32_t sessionStartMs      = 0;
+static uint32_t lastTickMs          = 0;
+static uint32_t stableAccumMs       = 0; // cumulative accepted stable time
+static uint32_t stableRunMs         = 0; // current continuous accepted stable run
+static uint32_t contactQualifiedMs  = 0; // cumulative dwell for lock qualification
+static uint32_t lastContactQualifyMs = 0;
 
 // =============================
 // Stable-only accumulators for FINAL summary
-// These store baseline-corrected values gathered only while stable.
+// These store baseline-corrected values gathered only while accepted.
 // =============================
 static double ide1StableSum = 0.0;
 static double ide2StableSum = 0.0;
 static uint16_t ide1StableSamples = 0;
 static uint16_t ide2StableSamples = 0;
 
+// Threshold validation counters (for experimental tuning logs)
+static uint16_t sessionStableTicks = 0;
+static uint16_t sessionRejectedLocalTicks = 0;
+static uint16_t sessionRejectedContactTicks = 0;
+static uint16_t sessionRejectedContinuityTicks = 0;
+
 // =============================
 // Startup calibration
-// On boot, measure open-air capacitance for 5 seconds and store
-// that average as the baseline to subtract from reported readings.
 // =============================
 static const uint32_t CALIBRATION_TIME_MS = 5000;
 
@@ -136,16 +170,17 @@ static float ide2BaselinePf = 0.0f;
 static bool baselineReady = false;
 
 // =============================
-// Session continuity lock (Option B)
-// Once a stable fish-contact state is found, lock onto the median
-// corrected value of each IDE and require future stable readings to
-// remain close to that same region. If continuity breaks, invalidate
-// the session immediately.
+// Session continuity lock
 // =============================
 static bool  referenceLocked = false;
 static float ide1RefPf       = 0.0f;
 static float ide2RefPf       = 0.0f;
-static const float REFERENCE_TOL_PF = 0.50f;
+
+// =============================
+// Forward declarations for BLE helpers used by callbacks
+// =============================
+static void startBleAdvertising(const char *reason);
+static void stopBleAdvertising(const char *reason);
 
 // =============================
 // Callbacks
@@ -153,20 +188,110 @@ static const float REFERENCE_TOL_PF = 0.50f;
 class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer*) override {
     gDeviceConnected = true;
+    gAdvertisingActive = false;
+    Serial.println("[BLE] Client connected");
   }
 
   void onDisconnect(BLEServer*) override {
     gDeviceConnected = false;
-    BLEDevice::startAdvertising();
+    gAdvertisingActive = false;
+    Serial.println("[BLE] Client disconnected");
+    delay(60);
+    startBleAdvertising("disconnect callback");
   }
 };
 
 // =============================
 // Helpers
 // =============================
+static void startBleAdvertising(const char *reason)
+{
+  if (!gAdvertising) {
+    Serial.print("[BLE] Advertising start skipped (null advertising) reason=");
+    Serial.println(reason);
+    gAdvertisingActive = false;
+    return;
+  }
+
+  if (gAdvertising->start()) {
+    gAdvertisingActive = true;
+    lastAdvertiseAttemptMs = millis();
+    Serial.print("[BLE] Advertising started: ");
+    Serial.println(reason);
+  } else {
+    gAdvertisingActive = false;
+    lastAdvertiseAttemptMs = millis();
+    Serial.print("[BLE] Advertising start failed: ");
+    Serial.println(reason);
+  }
+}
+
+static void stopBleAdvertising(const char *reason)
+{
+  if (!gAdvertising) return;
+
+  gAdvertising->stop();
+  gAdvertisingActive = false;
+  Serial.print("[BLE] Advertising stopped: ");
+  Serial.println(reason);
+}
+
+static const char* stateName(State s)
+{
+  switch (s) {
+    case ST_CALIBRATING:       return "CALIBRATING";
+    case ST_IDLE:              return "IDLE";
+    case ST_CONTACT_DETECTING: return "CONTACT_DETECTING";
+    case ST_REFERENCE_LOCKING: return "REFERENCE_LOCKING";
+    case ST_MEASURING_VALID:   return "MEASURING_VALID";
+    case ST_INVALIDATED:       return "INVALIDATED";
+    default:                   return "UNKNOWN";
+  }
+}
+
+static const char* failureName(FailureReason r)
+{
+  switch (r) {
+    case FAIL_NONE:               return "NONE";
+    case FAIL_TIMEOUT_NO_CONTACT: return "TIMEOUT_NO_CONTACT";
+    case FAIL_TIMEOUT_UNSTABLE:   return "TIMEOUT_UNSTABLE";
+    case FAIL_CONTINUITY_BROKEN:  return "CONTINUITY_BROKEN";
+    case FAIL_SENSOR_INVALID:     return "SENSOR_INVALID";
+    case FAIL_BLE_DISCONNECTED:   return "BLE_DISCONNECTED";
+    default:                      return "UNKNOWN";
+  }
+}
+
+static void setState(State nextState)
+{
+  if (state != nextState) {
+    Serial.print("[STATE] ");
+    Serial.print(stateName(state));
+    Serial.print(" -> ");
+    Serial.println(stateName(nextState));
+    state = nextState;
+  }
+}
+
+static void setFailure(FailureReason reason)
+{
+  lastFailureReason = reason;
+  if (reason != FAIL_NONE) {
+    Serial.print("[FAILURE] ");
+    Serial.println(failureName(reason));
+  }
+}
+
 static inline void ledWrite(int pin, bool on) {
   if (pin < 0) return;
   digitalWrite(pin, on ? HIGH : LOW);
+}
+
+static void resetClassificationLeds()
+{
+  ledWrite(LED_CLASS_FRESH_PIN, false);
+  ledWrite(LED_CLASS_MODERATE_PIN, false);
+  ledWrite(LED_CLASS_SPOILED_PIN, false);
 }
 
 static inline void pushSample(float *win, uint8_t &count, uint8_t &idx, float v)
@@ -213,6 +338,14 @@ static bool isStableSpread(const float *win, uint8_t count, float thresh_pf)
   return (mx - mn) <= thresh_pf;
 }
 
+static bool hasContactSignature(float ide1CalMed, bool ide1Valid,
+                                float ide2CalMed, bool ide2Valid)
+{
+  const bool ide1Contact = ide1Valid && !isnan(ide1CalMed) && (fabsf(ide1CalMed) >= CONTACT_MIN_PF_IDE1);
+  const bool ide2Contact = ide2Valid && !isnan(ide2CalMed) && (fabsf(ide2CalMed) >= CONTACT_MIN_PF_IDE2);
+  return ide1Contact && ide2Contact;
+}
+
 static void clearWindows()
 {
   for (uint8_t ch = 0; ch < NUM_CHANNELS; ch++) {
@@ -238,40 +371,43 @@ static void clearWindows()
 
 static void resetCalibration()
 {
-  // Reset timing and accumulators used during startup calibration.
   calibrationStartMs = 0;
-
-  // Running sums used to compute the average open-air baseline.
   ide1BaselineSum = 0.0;
   ide2BaselineSum = 0.0;
-
-  // Number of valid samples collected for each IDE pair.
   ide1BaselineSamples = 0;
   ide2BaselineSamples = 0;
-
-  // Final computed baseline values in pF.
   ide1BaselinePf = 0.0f;
   ide2BaselinePf = 0.0f;
-
-  // This becomes true once the calibration window completes.
   baselineReady = false;
-
-  // Clear rolling windows so calibration starts from a clean state.
   clearWindows();
+}
+
+static void resetSessionStats()
+{
+  stableAccumMs = 0;
+  stableRunMs = 0;
+  contactQualifiedMs = 0;
+  lastContactQualifyMs = 0;
+  ide1StableSum = 0.0;
+  ide2StableSum = 0.0;
+  ide1StableSamples = 0;
+  ide2StableSamples = 0;
+  lastTickMs = 0;
+
+  referenceLocked = false;
+  ide1RefPf = 0.0f;
+  ide2RefPf = 0.0f;
+
+  sessionStableTicks = 0;
+  sessionRejectedLocalTicks = 0;
+  sessionRejectedContactTicks = 0;
+  sessionRejectedContinuityTicks = 0;
+
+  lastFailureReason = FAIL_NONE;
 }
 
 static bool calibrationTickAndFinish(uint32_t nowMs)
 {
-  // ------------------------------------------------------------
-  // Startup calibration phase:
-  // For 5 seconds after power-up, measure the electrodes in
-  // open-air condition and compute the baseline capacitance.
-  //
-  // This baseline is later subtracted from IDE1 / IDE2 TRUE
-  // capacitance so Flutter receives baseline-corrected values.
-  // ------------------------------------------------------------
-
-  // Step 1: Read CH0..CH3 and update rolling windows.
   for (uint8_t ch = 0; ch < NUM_CHANNELS; ch++) {
     fdc1004_capacitance_t m =
         capacitanceSensor.getCapacitanceMeasurement((fdc1004_channel_t)ch);
@@ -283,7 +419,6 @@ static bool calibrationTickAndFinish(uint32_t nowMs)
     delay(10);
   }
 
-  // Step 2: Compute median-filtered capacitance for each channel.
   float chMed[NUM_CHANNELS];
   bool chValid[NUM_CHANNELS];
 
@@ -292,18 +427,12 @@ static bool calibrationTickAndFinish(uint32_t nowMs)
     chValid[ch] = !isnan(chMed[ch]);
   }
 
-  // Step 3: Compute TRUE capacitance for each IDE pair.
-  // IDE1 = average(CH0, CH1)
-  // IDE2 = average(CH2, CH3)
   const bool ide1TrueValid = chValid[0] && chValid[1];
   const bool ide2TrueValid = chValid[2] && chValid[3];
 
-  const float ide1True =
-      ide1TrueValid ? (0.5f * (chMed[0] + chMed[1])) : NAN;
-  const float ide2True =
-      ide2TrueValid ? (0.5f * (chMed[2] + chMed[3])) : NAN;
+  const float ide1True = ide1TrueValid ? (0.5f * (chMed[0] + chMed[1])) : NAN;
+  const float ide2True = ide2TrueValid ? (0.5f * (chMed[2] + chMed[3])) : NAN;
 
-  // Step 4: Accumulate raw TRUE capacitance values into baseline sums.
   if (ide1TrueValid) {
     ide1BaselineSum += (double)ide1True;
     ide1BaselineSamples++;
@@ -314,34 +443,20 @@ static bool calibrationTickAndFinish(uint32_t nowMs)
     ide2BaselineSamples++;
   }
 
-  // Step 5: Print calibration progress for serial debugging.
   Serial.print("[CAL] IDE1_RAW=");
-  if (ide1TrueValid) {
-    Serial.print(ide1True, 3);
-  } else {
-    Serial.print("ERR");
-  }
-
+  if (ide1TrueValid) Serial.print(ide1True, 3); else Serial.print("ERR");
   Serial.print("\tIDE2_RAW=");
-  if (ide2TrueValid) {
-    Serial.print(ide2True, 3);
-  } else {
-    Serial.print("ERR");
-  }
-
+  if (ide2TrueValid) Serial.print(ide2True, 3); else Serial.print("ERR");
   Serial.print("\telapsedMs=");
   Serial.println(nowMs - calibrationStartMs);
 
-  // Step 6: Finish calibration once the 5-second window has elapsed.
   if ((nowMs - calibrationStartMs) >= CALIBRATION_TIME_MS) {
     if (ide1BaselineSamples > 0) {
-      ide1BaselinePf =
-          (float)(ide1BaselineSum / (double)ide1BaselineSamples);
+      ide1BaselinePf = (float)(ide1BaselineSum / (double)ide1BaselineSamples);
     }
 
     if (ide2BaselineSamples > 0) {
-      ide2BaselinePf =
-          (float)(ide2BaselineSum / (double)ide2BaselineSamples);
+      ide2BaselinePf = (float)(ide2BaselineSum / (double)ide2BaselineSamples);
     }
 
     baselineReady = (ide1BaselineSamples > 0) || (ide2BaselineSamples > 0);
@@ -351,30 +466,13 @@ static bool calibrationTickAndFinish(uint32_t nowMs)
     Serial.println(ide1BaselinePf, 3);
     Serial.print("IDE2 baseline pF = ");
     Serial.println(ide2BaselinePf, 3);
+    Serial.println("[TUNE] Contact thresholds should be validated against repeated fish-contact trials.");
 
-    // Clear windows so the actual measurement session starts fresh.
     clearWindows();
     return true;
   }
 
-  // Calibration still in progress.
   return false;
-}
-
-static void resetSessionStats()
-{
-  stableAccumMs = 0;
-  stableRunMs   = 0;
-  ide1StableSum = 0.0;
-  ide2StableSum = 0.0;
-  ide1StableSamples = 0;
-  ide2StableSamples = 0;
-  lastTickMs = 0;
-
-  // Reset the session continuity lock so every button press starts fresh.
-  referenceLocked = false;
-  ide1RefPf = 0.0f;
-  ide2RefPf = 0.0f;
 }
 
 static bool buttonPressedEvent()
@@ -463,24 +561,44 @@ static void setupBle()
 
   svc->start();
 
-  BLEAdvertising *adv = BLEDevice::getAdvertising();
-  adv->addServiceUUID(UUID_SVC_IDE);
-  adv->setScanResponse(true);
-  adv->start();
+  gAdvertising = BLEDevice::getAdvertising();
+  gAdvertising->addServiceUUID(UUID_SVC_IDE);
+  gAdvertising->setScanResponse(true);
+  startBleAdvertising("setupBle");
 
   Serial.println("✓ BLE notify service started");
 }
 
+static void finishInvalidSession(float ide1Pf, bool ide1Valid,
+                                 float ide2Pf, bool ide2Valid,
+                                 FailureReason reason)
+{
+  setFailure(reason);
+  sendPacket(ide1Pf, ide1Valid, ide2Pf, ide2Valid, false, false, true);
+
+  Serial.print("== FINAL: INVALID SESSION / ");
+  Serial.print(failureName(reason));
+  Serial.println(" ==");
+
+  Serial.print("[SUMMARY] stableTicks=");
+  Serial.print(sessionStableTicks);
+  Serial.print("\trejectLocal=");
+  Serial.print(sessionRejectedLocalTicks);
+  Serial.print("\trejectContact=");
+  Serial.print(sessionRejectedContactTicks);
+  Serial.print("\trejectContinuity=");
+  Serial.println(sessionRejectedContinuityTicks);
+
+  ledWrite(LED_STABILITY_PIN, false);
+  ledWrite(LED_MEASURING_PIN, false);
+  setState(ST_INVALIDATED);
+}
+
 // =============================
 // One measurement tick
-// - Differential is used ONLY for stability
-// - TRUE capacitance is baseline-corrected for reporting
-// - Stable sample packets are notified on every stable tick
-// - FINAL packet is sent once on success or timeout
 // =============================
 static bool measurementTickAndMaybeFinish(uint32_t nowMs)
 {
-  // Step 1: Read CH0..CH3 and update rolling windows.
   for (uint8_t ch = 0; ch < NUM_CHANNELS; ch++) {
     fdc1004_capacitance_t m =
         capacitanceSensor.getCapacitanceMeasurement((fdc1004_channel_t)ch);
@@ -491,7 +609,6 @@ static bool measurementTickAndMaybeFinish(uint32_t nowMs)
     delay(10);
   }
 
-  // Step 2: Compute median-filtered raw capacitance for each channel.
   float chMed[NUM_CHANNELS];
   bool  chValid[NUM_CHANNELS];
 
@@ -500,19 +617,15 @@ static bool measurementTickAndMaybeFinish(uint32_t nowMs)
     chValid[ch] = !isnan(chMed[ch]);
   }
 
-  // Step 3: Compute TRUE capacitance values for IDE1 and IDE2.
   const bool ide1TrueValid = chValid[0] && chValid[1];
   const bool ide2TrueValid = chValid[2] && chValid[3];
 
   const float ide1True = ide1TrueValid ? (0.5f * (chMed[0] + chMed[1])) : NAN;
   const float ide2True = ide2TrueValid ? (0.5f * (chMed[2] + chMed[3])) : NAN;
 
-  // Step 4: Subtract the startup baseline so the reported values represent
-  // capacitance above the open-air/base level.
   const float ide1Cal = ide1TrueValid ? (ide1True - ide1BaselinePf) : NAN;
   const float ide2Cal = ide2TrueValid ? (ide2True - ide2BaselinePf) : NAN;
 
-  // Step 5: Compute pseudo-differential values used for first-layer electrical stability.
   const bool ide1DiffValid = ide1TrueValid;
   const bool ide2DiffValid = ide2TrueValid;
 
@@ -522,56 +635,85 @@ static bool measurementTickAndMaybeFinish(uint32_t nowMs)
   if (ide1DiffValid) pushSample(ide1DiffWin, ide1DiffCount, ide1DiffIdx, ide1Diff);
   if (ide2DiffValid) pushSample(ide2DiffWin, ide2DiffCount, ide2DiffIdx, ide2Diff);
 
-  // Step 6: Store baseline-corrected TRUE capacitance for second-layer value stability.
   if (ide1TrueValid) pushSample(ide1CalWin, ide1CalCount, ide1CalIdx, ide1Cal);
   if (ide2TrueValid) pushSample(ide2CalWin, ide2CalCount, ide2CalIdx, ide2Cal);
 
-  // Layer 1: differential/electrical stability
   const bool diffStable1 = ide1DiffValid && isStableSpread(ide1DiffWin, ide1DiffCount, STABLE_SPREAD_PF);
   const bool diffStable2 = ide2DiffValid && isStableSpread(ide2DiffWin, ide2DiffCount, STABLE_SPREAD_PF);
-
-  // Layer 2: corrected-value local stability
   const bool valueStable1 = ide1TrueValid && isStableSpread(ide1CalWin, ide1CalCount, VALUE_SPREAD_PF);
   const bool valueStable2 = ide2TrueValid && isStableSpread(ide2CalWin, ide2CalCount, VALUE_SPREAD_PF);
 
-  // Local stability must pass before a session can lock or continue.
   const bool localStableNow = diffStable1 && diffStable2 && valueStable1 && valueStable2;
 
-  // Use the median of the corrected-value windows as the session reference.
   const float ide1CalMed = medianOf(ide1CalWin, ide1CalCount);
   const float ide2CalMed = medianOf(ide2CalWin, ide2CalCount);
 
-  // If no reference is locked yet and the signal is locally stable,
-  // lock the current fish-contact state using the corrected-value medians.
-  if (!referenceLocked && localStableNow) {
+  const bool contactQualifiedNow = hasContactSignature(ide1CalMed, ide1TrueValid,
+                                                       ide2CalMed, ide2TrueValid);
+
+  const uint32_t dt = (lastTickMs == 0) ? MEASUREMENT_DELAY_MS : (nowMs - lastTickMs);
+  lastTickMs = nowMs;
+
+  if (!ide1TrueValid || !ide2TrueValid) {
+    sessionRejectedLocalTicks++;
+  }
+
+  if (localStableNow && contactQualifiedNow && !referenceLocked) {
+    contactQualifiedMs += dt;
+  } else if (!referenceLocked) {
+    contactQualifiedMs = 0;
+  }
+
+  if (!referenceLocked) {
+    if (!localStableNow) {
+      sessionRejectedLocalTicks++;
+      setState(ST_CONTACT_DETECTING);
+    } else if (!contactQualifiedNow) {
+      sessionRejectedContactTicks++;
+      setState(ST_CONTACT_DETECTING);
+      if ((sessionRejectedContactTicks % CONTACT_REJECT_LOG_INTERVAL) == 0) {
+        Serial.print("[CONTACT] Rejected stable window: ide1Med=");
+        if (!isnan(ide1CalMed)) Serial.print(ide1CalMed, 3); else Serial.print("ERR");
+        Serial.print(" ide2Med=");
+        if (!isnan(ide2CalMed)) Serial.print(ide2CalMed, 3); else Serial.print("ERR");
+        Serial.print(" thresholds=(");
+        Serial.print(CONTACT_MIN_PF_IDE1, 3);
+        Serial.print(", ");
+        Serial.print(CONTACT_MIN_PF_IDE2, 3);
+        Serial.println(")");
+      }
+    } else if (contactQualifiedMs < LOCK_STABLE_HOLD_MS) {
+      setState(ST_REFERENCE_LOCKING);
+    }
+  }
+
+  if (!referenceLocked && localStableNow && contactQualifiedNow && contactQualifiedMs >= LOCK_STABLE_HOLD_MS) {
     ide1RefPf = ide1CalMed;
     ide2RefPf = ide2CalMed;
     referenceLocked = true;
+    setState(ST_MEASURING_VALID);
+
+    Serial.println("[LOCK] Reference locked after qualified contact dwell");
+    Serial.print("[LOCK] ide1Ref=");
+    Serial.print(ide1RefPf, 3);
+    Serial.print("\tide2Ref=");
+    Serial.println(ide2RefPf, 3);
   }
 
-  // Layer 3 / Option B: session continuity check.
-  // Once locked, the current corrected-value medians must remain close to the
-  // original reference. If not, the fish/contact state changed too much.
   const bool continuity1 =
       referenceLocked && !isnan(ide1CalMed) && (fabsf(ide1CalMed - ide1RefPf) <= REFERENCE_TOL_PF);
   const bool continuity2 =
       referenceLocked && !isnan(ide2CalMed) && (fabsf(ide2CalMed - ide2RefPf) <= REFERENCE_TOL_PF);
 
-  const bool stableNow = localStableNow && continuity1 && continuity2;
+  const bool stableNow = referenceLocked && localStableNow && continuity1 && continuity2;
   const bool continuityBroken = referenceLocked && localStableNow && (!continuity1 || !continuity2);
 
-  // Green LED mirrors the final acceptance decision.
   ledWrite(LED_STABILITY_PIN, stableNow);
 
-  // Accurate dt per tick.
-  uint32_t dt = (lastTickMs == 0) ? MEASUREMENT_DELAY_MS : (nowMs - lastTickMs);
-  lastTickMs = nowMs;
-
-  // Step 7: If final stability is achieved, accumulate stable time and collect
-  // baseline-corrected values that will later be averaged into the FINAL packet.
   if (stableNow) {
     stableAccumMs += dt;
     stableRunMs += dt;
+    sessionStableTicks++;
 
     if (ide1TrueValid) {
       ide1StableSum += (double)ide1Cal;
@@ -582,19 +724,22 @@ static bool measurementTickAndMaybeFinish(uint32_t nowMs)
       ide2StableSamples++;
     }
 
-    // Send a live packet on every accepted stable tick.
     sendPacket(ide1Cal, ide1TrueValid, ide2Cal, ide2TrueValid,
                true, false, false);
   } else {
     stableRunMs = 0;
+    if (referenceLocked && !continuity1) sessionRejectedContinuityTicks++;
+    if (referenceLocked && !continuity2) sessionRejectedContinuityTicks++;
   }
 
   const uint32_t elapsed = nowMs - sessionStartMs;
   const bool sessionValid = (stableAccumMs >= REQUIRED_STABLE_ACCUM_MS);
   const bool timedOut     = (elapsed >= SESSION_TIMEOUT_MS);
+  const bool contactTimedOut = (!referenceLocked && elapsed >= CONTACT_DETECT_TIMEOUT_MS);
 
-  // Debug serial output.
-  Serial.print("CH0=");
+  Serial.print("state=");
+  Serial.print(stateName(state));
+  Serial.print("\tCH0=");
   if (chValid[0]) Serial.print(chMed[0], 3); else Serial.print("ERR");
   Serial.print("\tCH1=");
   if (chValid[1]) Serial.print(chMed[1], 3); else Serial.print("ERR");
@@ -610,6 +755,10 @@ static bool measurementTickAndMaybeFinish(uint32_t nowMs)
 
   Serial.print("\tlocalStableNow=");
   Serial.print(localStableNow ? 1 : 0);
+  Serial.print("\tcontactQualifiedNow=");
+  Serial.print(contactQualifiedNow ? 1 : 0);
+  Serial.print("\tcontactQualifiedMs=");
+  Serial.print(contactQualifiedMs);
   Serial.print("\trefLocked=");
   Serial.print(referenceLocked ? 1 : 0);
   Serial.print("\tide1Ref=");
@@ -624,8 +773,6 @@ static bool measurementTickAndMaybeFinish(uint32_t nowMs)
   Serial.print(continuity1 ? 1 : 0);
   Serial.print("\tcontinuity2=");
   Serial.print(continuity2 ? 1 : 0);
-  Serial.print("\tcontinuityBroken=");
-  Serial.print(continuityBroken ? 1 : 0);
   Serial.print("\tstableNow=");
   Serial.print(stableNow ? 1 : 0);
   Serial.print("\tstableRunMs=");
@@ -635,34 +782,49 @@ static bool measurementTickAndMaybeFinish(uint32_t nowMs)
   Serial.print("\telapsedMs=");
   Serial.println(elapsed);
 
-  // If continuity breaks after the session has already locked onto a fish-contact
-  // state, immediately invalidate the session and force a restart.
+  if (!gDeviceConnected && referenceLocked) {
+    Serial.println("[WARN] BLE disconnected during active measurement");
+    if (!gAdvertisingActive) {
+      startBleAdvertising("measurement watchdog");
+    }
+  }
+
   if (continuityBroken) {
-    sendPacket(ide1Cal, ide1TrueValid, ide2Cal, ide2TrueValid,
-               false, false, true);
-
-    Serial.println("== FINAL: CONTINUITY BROKEN / INVALID SESSION ==");
-
-    ledWrite(LED_STABILITY_PIN, false);
-    ledWrite(LED_MEASURING_PIN, false);
+    finishInvalidSession(ide1Cal, ide1TrueValid, ide2Cal, ide2TrueValid,
+                         FAIL_CONTINUITY_BROKEN);
     return true;
   }
 
-  // Step 8: Finish if enough stable time has accumulated OR timeout occurs.
+  if (contactTimedOut) {
+    finishInvalidSession(ide1Cal, ide1TrueValid, ide2Cal, ide2TrueValid,
+                         FAIL_TIMEOUT_NO_CONTACT);
+    return true;
+  }
+
   if (sessionValid || timedOut) {
-    bool ide1AvgValid = (ide1StableSamples > 0);
-    bool ide2AvgValid = (ide2StableSamples > 0);
+    if (sessionValid) {
+      bool ide1AvgValid = (ide1StableSamples > 0);
+      bool ide2AvgValid = (ide2StableSamples > 0);
 
-    float ide1Avg = ide1AvgValid ? (float)(ide1StableSum / (double)ide1StableSamples) : NAN;
-    float ide2Avg = ide2AvgValid ? (float)(ide2StableSum / (double)ide2StableSamples) : NAN;
+      float ide1Avg = ide1AvgValid ? (float)(ide1StableSum / (double)ide1StableSamples) : NAN;
+      float ide2Avg = ide2AvgValid ? (float)(ide2StableSum / (double)ide2StableSamples) : NAN;
 
-    // FINAL packet carries the stable-only average summary.
-    sendPacket(ide1Avg, ide1AvgValid, ide2Avg, ide2AvgValid,
-               stableNow, sessionValid, true);
+      sendPacket(ide1Avg, ide1AvgValid, ide2Avg, ide2AvgValid,
+                 stableNow, true, true);
 
-    Serial.println(sessionValid
-      ? "== FINAL: VALID SESSION =="
-      : "== FINAL: TIMEOUT / INVALID SESSION ==");
+      Serial.println("== FINAL: VALID SESSION ==");
+      Serial.print("[SUMMARY] stableTicks=");
+      Serial.print(sessionStableTicks);
+      Serial.print("\trejectLocal=");
+      Serial.print(sessionRejectedLocalTicks);
+      Serial.print("\trejectContact=");
+      Serial.print(sessionRejectedContactTicks);
+      Serial.print("\trejectContinuity=");
+      Serial.println(sessionRejectedContinuityTicks);
+    } else {
+      finishInvalidSession(ide1Cal, ide1TrueValid, ide2Cal, ide2TrueValid,
+                           referenceLocked ? FAIL_TIMEOUT_UNSTABLE : FAIL_TIMEOUT_NO_CONTACT);
+    }
 
     ledWrite(LED_STABILITY_PIN, false);
     ledWrite(LED_MEASURING_PIN, false);
@@ -684,14 +846,18 @@ void setup()
   pinMode(LED_POWER_RED_PIN, OUTPUT);
   pinMode(LED_STABILITY_PIN, OUTPUT);
   if (LED_MEASURING_PIN >= 0) pinMode(LED_MEASURING_PIN, OUTPUT);
+  if (LED_CLASS_FRESH_PIN >= 0) pinMode(LED_CLASS_FRESH_PIN, OUTPUT);
+  if (LED_CLASS_MODERATE_PIN >= 0) pinMode(LED_CLASS_MODERATE_PIN, OUTPUT);
+  if (LED_CLASS_SPOILED_PIN >= 0) pinMode(LED_CLASS_SPOILED_PIN, OUTPUT);
 
   ledWrite(LED_POWER_RED_PIN, true);
   ledWrite(LED_STABILITY_PIN, false);
   ledWrite(LED_MEASURING_PIN, false);
+  resetClassificationLeds();
 
   Wire1.setPins(I2C_SDA, I2C_SCL);
 
-  Serial.println("FDC1004 BLE Flow: button-start, stable sample notify, FINAL notify");
+  Serial.println("FDC1004 BLE Flow: button-start, qualified contact lock, stable sample notify, FINAL notify");
 
   if (!capacitanceSensor.begin()) {
     Serial.println("✗ FDC1004 init failed");
@@ -705,11 +871,9 @@ void setup()
 
   setupBle();
 
-  // Start the device in calibration mode so open-air baseline is measured
-  // before any user measurement sessions are allowed.
   resetCalibration();
   calibrationStartMs = millis();
-  state = ST_CALIBRATING;
+  setState(ST_CALIBRATING);
 
   Serial.println("== STARTUP CALIBRATION ==");
   Serial.println("Keep electrodes in open air for 5 seconds...");
@@ -717,15 +881,15 @@ void setup()
 
 void loop()
 {
-  // ------------------------------------------------------------
-  // STATE: CALIBRATING
-  // On power-up, spend 5 seconds measuring the electrode baseline
-  // in open air before allowing sessions.
-  // ------------------------------------------------------------
   if (state == ST_CALIBRATING) {
     ledWrite(LED_POWER_RED_PIN, true);
     ledWrite(LED_STABILITY_PIN, false);
     ledWrite(LED_MEASURING_PIN, false);
+
+    const uint32_t nowCalAdv = millis();
+    if (!gDeviceConnected && (!gAdvertisingActive || (nowCalAdv - lastAdvertiseAttemptMs >= 3000))) {
+      startBleAdvertising("calibrating watchdog");
+    }
 
     static uint32_t lastCalibrationTickMs = 0;
     const uint32_t now = millis();
@@ -735,39 +899,45 @@ void loop()
 
       const bool done = calibrationTickAndFinish(now);
       if (done) {
-        state = ST_IDLE;
-
+        setState(ST_IDLE);
         Serial.println("== DEVICE READY ==");
         Serial.println("Press button to start measurement session.\n");
       }
     }
-
     return;
   }
 
-  // Start session from physical button only when idle.
   if (state == ST_IDLE && buttonPressedEvent()) {
     clearWindows();
     resetSessionStats();
     sessionStartMs = millis();
 
-    state = ST_MEASURING;
+    setState(ST_CONTACT_DETECTING);
     ledWrite(LED_STABILITY_PIN, false);
     ledWrite(LED_MEASURING_PIN, true);
 
     Serial.println("== SESSION START ==");
+    Serial.print("[CONFIG] contact thresholds IDE1/IDE2 = ");
+    Serial.print(CONTACT_MIN_PF_IDE1, 3);
+    Serial.print(" / ");
+    Serial.println(CONTACT_MIN_PF_IDE2, 3);
+    Serial.print("[CONFIG] lock dwell ms = ");
+    Serial.println(LOCK_STABLE_HOLD_MS);
   }
 
   if (state == ST_IDLE) {
-    // True idle: no sampling, no notifications, green/orange LEDs off.
     ledWrite(LED_STABILITY_PIN, false);
     ledWrite(LED_MEASURING_PIN, false);
+
+    const uint32_t nowIdle = millis();
+    if (!gDeviceConnected && (!gAdvertisingActive || (nowIdle - lastAdvertiseAttemptMs >= 3000))) {
+      startBleAdvertising("idle watchdog");
+    }
+
     delay(50);
     return;
   }
 
-  // STATE: MEASURING
-  // Run one measurement tick every 500 ms.
   static uint32_t lastScheduleMs = 0;
   const uint32_t now = millis();
 
@@ -776,7 +946,7 @@ void loop()
 
     const bool finished = measurementTickAndMaybeFinish(now);
     if (finished) {
-      state = ST_IDLE;
+      setState(ST_IDLE);
       Serial.println("== SESSION END (IDLE) ==");
       Serial.println("Press button again to start a new session.\n");
     }
