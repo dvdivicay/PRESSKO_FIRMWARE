@@ -11,9 +11,12 @@
 // USER PINS
 // =============================
 static const int BUTTON_PIN             = 27; // Active-LOW button to GND, uses INPUT_PULLUP
-static const int LED_POWER_RED_PIN      = 25; // Red LED (power)
-static const int LED_STABLE_GRN_PIN     = 26; // Green LED (stable)
-static const int LED_MEASURE_ORANGE_PIN = 14; // Orange LED (measuring mode)
+static const int LED_POWER_RED_PIN      = 15; // Red LED (power)
+static const int LED_STABILITY_PIN     = 2; // Green LED (stable)
+static const int LED_MEASURING_PIN      = 12; // Orange LED (measuring mode)
+static const int LED_CLASS_FRESH_PIN      = 0; // AI model Classification (Fresh)
+static const int LED_CLASS_MODERATE_PIN      = 4; // AI model Classification (Moderately Fresh)
+static const int LED_CLASS_SPOILED_PIN      = 16; // AI model Classification (Spoiled)
 
 // =============================
 // I2C + Sensor
@@ -131,6 +134,18 @@ static float ide1BaselinePf = 0.0f;
 static float ide2BaselinePf = 0.0f;
 
 static bool baselineReady = false;
+
+// =============================
+// Session continuity lock (Option B)
+// Once a stable fish-contact state is found, lock onto the median
+// corrected value of each IDE and require future stable readings to
+// remain close to that same region. If continuity breaks, invalidate
+// the session immediately.
+// =============================
+static bool  referenceLocked = false;
+static float ide1RefPf       = 0.0f;
+static float ide2RefPf       = 0.0f;
+static const float REFERENCE_TOL_PF = 0.50f;
 
 // =============================
 // Callbacks
@@ -355,6 +370,11 @@ static void resetSessionStats()
   ide1StableSamples = 0;
   ide2StableSamples = 0;
   lastTickMs = 0;
+
+  // Reset the session continuity lock so every button press starts fresh.
+  referenceLocked = false;
+  ide1RefPf = 0.0f;
+  ide2RefPf = 0.0f;
 }
 
 static bool buttonPressedEvent()
@@ -510,15 +530,38 @@ static bool measurementTickAndMaybeFinish(uint32_t nowMs)
   const bool diffStable1 = ide1DiffValid && isStableSpread(ide1DiffWin, ide1DiffCount, STABLE_SPREAD_PF);
   const bool diffStable2 = ide2DiffValid && isStableSpread(ide2DiffWin, ide2DiffCount, STABLE_SPREAD_PF);
 
-  // Layer 2: corrected-value stability
+  // Layer 2: corrected-value local stability
   const bool valueStable1 = ide1TrueValid && isStableSpread(ide1CalWin, ide1CalCount, VALUE_SPREAD_PF);
   const bool valueStable2 = ide2TrueValid && isStableSpread(ide2CalWin, ide2CalCount, VALUE_SPREAD_PF);
 
-  // Final acceptance requires both layers to pass for both IDE pairs.
-  const bool stableNow = diffStable1 && diffStable2 && valueStable1 && valueStable2;
+  // Local stability must pass before a session can lock or continue.
+  const bool localStableNow = diffStable1 && diffStable2 && valueStable1 && valueStable2;
 
-  // Green LED mirrors the final, third-layer acceptance decision.
-  ledWrite(LED_STABLE_GRN_PIN, stableNow);
+  // Use the median of the corrected-value windows as the session reference.
+  const float ide1CalMed = medianOf(ide1CalWin, ide1CalCount);
+  const float ide2CalMed = medianOf(ide2CalWin, ide2CalCount);
+
+  // If no reference is locked yet and the signal is locally stable,
+  // lock the current fish-contact state using the corrected-value medians.
+  if (!referenceLocked && localStableNow) {
+    ide1RefPf = ide1CalMed;
+    ide2RefPf = ide2CalMed;
+    referenceLocked = true;
+  }
+
+  // Layer 3 / Option B: session continuity check.
+  // Once locked, the current corrected-value medians must remain close to the
+  // original reference. If not, the fish/contact state changed too much.
+  const bool continuity1 =
+      referenceLocked && !isnan(ide1CalMed) && (fabsf(ide1CalMed - ide1RefPf) <= REFERENCE_TOL_PF);
+  const bool continuity2 =
+      referenceLocked && !isnan(ide2CalMed) && (fabsf(ide2CalMed - ide2RefPf) <= REFERENCE_TOL_PF);
+
+  const bool stableNow = localStableNow && continuity1 && continuity2;
+  const bool continuityBroken = referenceLocked && localStableNow && (!continuity1 || !continuity2);
+
+  // Green LED mirrors the final acceptance decision.
+  ledWrite(LED_STABILITY_PIN, stableNow);
 
   // Accurate dt per tick.
   uint32_t dt = (lastTickMs == 0) ? MEASUREMENT_DELAY_MS : (nowMs - lastTickMs);
@@ -539,7 +582,7 @@ static bool measurementTickAndMaybeFinish(uint32_t nowMs)
       ide2StableSamples++;
     }
 
-    // Send a live packet on every stable tick.
+    // Send a live packet on every accepted stable tick.
     sendPacket(ide1Cal, ide1TrueValid, ide2Cal, ide2TrueValid,
                true, false, false);
   } else {
@@ -565,6 +608,24 @@ static bool measurementTickAndMaybeFinish(uint32_t nowMs)
   Serial.print("\tIDE2_CAL=");
   if (ide2TrueValid) Serial.print(ide2Cal, 3); else Serial.print("ERR");
 
+  Serial.print("\tlocalStableNow=");
+  Serial.print(localStableNow ? 1 : 0);
+  Serial.print("\trefLocked=");
+  Serial.print(referenceLocked ? 1 : 0);
+  Serial.print("\tide1Ref=");
+  if (referenceLocked) Serial.print(ide1RefPf, 3); else Serial.print("NA");
+  Serial.print("\tide2Ref=");
+  if (referenceLocked) Serial.print(ide2RefPf, 3); else Serial.print("NA");
+  Serial.print("\tide1Med=");
+  if (!isnan(ide1CalMed)) Serial.print(ide1CalMed, 3); else Serial.print("ERR");
+  Serial.print("\tide2Med=");
+  if (!isnan(ide2CalMed)) Serial.print(ide2CalMed, 3); else Serial.print("ERR");
+  Serial.print("\tcontinuity1=");
+  Serial.print(continuity1 ? 1 : 0);
+  Serial.print("\tcontinuity2=");
+  Serial.print(continuity2 ? 1 : 0);
+  Serial.print("\tcontinuityBroken=");
+  Serial.print(continuityBroken ? 1 : 0);
   Serial.print("\tstableNow=");
   Serial.print(stableNow ? 1 : 0);
   Serial.print("\tstableRunMs=");
@@ -574,7 +635,20 @@ static bool measurementTickAndMaybeFinish(uint32_t nowMs)
   Serial.print("\telapsedMs=");
   Serial.println(elapsed);
 
-  // Step 7: Finish if enough stable time has accumulated OR timeout occurs.
+  // If continuity breaks after the session has already locked onto a fish-contact
+  // state, immediately invalidate the session and force a restart.
+  if (continuityBroken) {
+    sendPacket(ide1Cal, ide1TrueValid, ide2Cal, ide2TrueValid,
+               false, false, true);
+
+    Serial.println("== FINAL: CONTINUITY BROKEN / INVALID SESSION ==");
+
+    ledWrite(LED_STABILITY_PIN, false);
+    ledWrite(LED_MEASURING_PIN, false);
+    return true;
+  }
+
+  // Step 8: Finish if enough stable time has accumulated OR timeout occurs.
   if (sessionValid || timedOut) {
     bool ide1AvgValid = (ide1StableSamples > 0);
     bool ide2AvgValid = (ide2StableSamples > 0);
@@ -590,8 +664,8 @@ static bool measurementTickAndMaybeFinish(uint32_t nowMs)
       ? "== FINAL: VALID SESSION =="
       : "== FINAL: TIMEOUT / INVALID SESSION ==");
 
-    ledWrite(LED_STABLE_GRN_PIN, false);
-    ledWrite(LED_MEASURE_ORANGE_PIN, false);
+    ledWrite(LED_STABILITY_PIN, false);
+    ledWrite(LED_MEASURING_PIN, false);
     return true;
   }
 
@@ -608,12 +682,12 @@ void setup()
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   pinMode(LED_POWER_RED_PIN, OUTPUT);
-  pinMode(LED_STABLE_GRN_PIN, OUTPUT);
-  if (LED_MEASURE_ORANGE_PIN >= 0) pinMode(LED_MEASURE_ORANGE_PIN, OUTPUT);
+  pinMode(LED_STABILITY_PIN, OUTPUT);
+  if (LED_MEASURING_PIN >= 0) pinMode(LED_MEASURING_PIN, OUTPUT);
 
   ledWrite(LED_POWER_RED_PIN, true);
-  ledWrite(LED_STABLE_GRN_PIN, false);
-  ledWrite(LED_MEASURE_ORANGE_PIN, false);
+  ledWrite(LED_STABILITY_PIN, false);
+  ledWrite(LED_MEASURING_PIN, false);
 
   Wire1.setPins(I2C_SDA, I2C_SCL);
 
@@ -650,8 +724,8 @@ void loop()
   // ------------------------------------------------------------
   if (state == ST_CALIBRATING) {
     ledWrite(LED_POWER_RED_PIN, true);
-    ledWrite(LED_STABLE_GRN_PIN, false);
-    ledWrite(LED_MEASURE_ORANGE_PIN, false);
+    ledWrite(LED_STABILITY_PIN, false);
+    ledWrite(LED_MEASURING_PIN, false);
 
     static uint32_t lastCalibrationTickMs = 0;
     const uint32_t now = millis();
@@ -678,16 +752,16 @@ void loop()
     sessionStartMs = millis();
 
     state = ST_MEASURING;
-    ledWrite(LED_STABLE_GRN_PIN, false);
-    ledWrite(LED_MEASURE_ORANGE_PIN, true);
+    ledWrite(LED_STABILITY_PIN, false);
+    ledWrite(LED_MEASURING_PIN, true);
 
     Serial.println("== SESSION START ==");
   }
 
   if (state == ST_IDLE) {
     // True idle: no sampling, no notifications, green/orange LEDs off.
-    ledWrite(LED_STABLE_GRN_PIN, false);
-    ledWrite(LED_MEASURE_ORANGE_PIN, false);
+    ledWrite(LED_STABILITY_PIN, false);
+    ledWrite(LED_MEASURING_PIN, false);
     delay(50);
     return;
   }
