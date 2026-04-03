@@ -101,6 +101,7 @@ static BLECharacteristic *gPktChr = nullptr;
 static BLEAdvertising    *gAdvertising = nullptr;
 static bool gDeviceConnected = false;
 static bool gAdvertisingActive = false;
+static volatile bool gRestartAdvertisingRequested = false;
 static uint32_t lastAdvertiseAttemptMs = 0;
 static uint16_t gSeq = 0;
 
@@ -189,15 +190,15 @@ class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer*) override {
     gDeviceConnected = true;
     gAdvertisingActive = false;
+    gRestartAdvertisingRequested = false;
     Serial.println("[BLE] Client connected");
   }
 
   void onDisconnect(BLEServer*) override {
     gDeviceConnected = false;
     gAdvertisingActive = false;
+    gRestartAdvertisingRequested = true;
     Serial.println("[BLE] Client disconnected");
-    delay(60);
-    startBleAdvertising("disconnect callback");
   }
 };
 
@@ -206,6 +207,9 @@ class ServerCallbacks : public BLEServerCallbacks {
 // =============================
 static void startBleAdvertising(const char *reason)
 {
+  Serial.print("[BLE] startBleAdvertising called: ");
+  Serial.println(reason);
+
   if (!gAdvertising) {
     Serial.print("[BLE] Advertising start skipped (null advertising) reason=");
     Serial.println(reason);
@@ -213,6 +217,7 @@ static void startBleAdvertising(const char *reason)
     return;
   }
 
+  Serial.println("[BLE] Calling gAdvertising->start()...");
   if (gAdvertising->start()) {
     gAdvertisingActive = true;
     lastAdvertiseAttemptMs = millis();
@@ -881,12 +886,19 @@ void setup()
 
 void loop()
 {
+  if (!gDeviceConnected && gRestartAdvertisingRequested) {
+    gRestartAdvertisingRequested = false;
+    startBleAdvertising("deferred disconnect restart");
+  }
+
   if (state == ST_CALIBRATING) {
     ledWrite(LED_POWER_RED_PIN, true);
     ledWrite(LED_STABILITY_PIN, false);
     ledWrite(LED_MEASURING_PIN, false);
 
     const uint32_t nowCalAdv = millis();
+    // Watchdog retry: if advertising silently stopped while nobody is connected,
+    // try again every few seconds instead of relying on a single callback restart.
     if (!gDeviceConnected && (!gAdvertisingActive || (nowCalAdv - lastAdvertiseAttemptMs >= 3000))) {
       startBleAdvertising("calibrating watchdog");
     }
