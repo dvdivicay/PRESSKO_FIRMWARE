@@ -45,12 +45,12 @@ static const uint32_t LOCK_STABLE_HOLD_MS  = 2000;  // stable + contact-qualifie
 static const float    REFERENCE_TOL_PF     = 0.50f;
 static const uint16_t CONTACT_REJECT_LOG_INTERVAL = 4;
 
-// Rolling windows for raw capacitance from CH2 and CH3
+// Rolling windows for raw capacitance from CH0 and CH1
 static float   rawWin[NUM_USED_CHANNELS][MEDIAN_WIN];
 static uint8_t rawCount[NUM_USED_CHANNELS] = {0};
 static uint8_t rawIdx[NUM_USED_CHANNELS]   = {0};
 
-// Window for IDE differential: CH2 - CH3
+// Window for IDE differential: CH0 - CH1
 static float   ideDiffWin[MEDIAN_WIN];
 static uint8_t ideDiffCount = 0;
 static uint8_t ideDiffIdx   = 0;
@@ -675,9 +675,9 @@ static bool measurementTickAndMaybeFinish(uint32_t nowMs)
 
   Serial.print("state=");
   Serial.print(stateName(state));
-  Serial.print("\tCH2=");
+  Serial.print("\tCH0=");
   if (chValid[0]) Serial.print(chMed[0], 3); else Serial.print("ERR");
-  Serial.print("\tCH3=");
+  Serial.print("\tCH1=");
   if (chValid[1]) Serial.print(chMed[1], 3); else Serial.print("ERR");
   Serial.print("\tIDE_CAL=");
   if (ideValid) Serial.print(ideCal, 3); else Serial.print("ERR");
@@ -780,7 +780,7 @@ void setup()
 
   Wire1.setPins(I2C_SDA, I2C_SCL);
 
-  Serial.println("FDC1004 BLE Flow: one IDE only (CH2 + CH3), button-start, qualified contact lock, stable sample notify, FINAL notify");
+  Serial.println("FDC1004 BLE Flow: one IDE only (CH0 + CH1), button-start, qualified contact lock, stable sample notify, FINAL notify");
 
   if (!capacitanceSensor.begin()) {
     Serial.println("✗ FDC1004 init failed");
