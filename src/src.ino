@@ -24,7 +24,7 @@ static const int LED_CLASS_SPOILED_PIN     = 16; // Reserved for Flutter AI clas
 static const int I2C_SDA = 21;
 static const int I2C_SCL = 22;
 
-// Use only channels 2 and 3 for one IDE
+// Use only channels 0 and 1 for one IDE
 static const uint8_t IDE_CH_A = 0;
 static const uint8_t IDE_CH_B = 1;
 static const uint8_t NUM_USED_CHANNELS = 2;
@@ -420,9 +420,9 @@ static bool calibrationTickAndFinish(uint32_t nowMs)
     ideBaselineSamples++;
   }
 
-  Serial.print("[CAL] CH2_RAW=");
+  Serial.print("[CAL] CH0_RAW=");
   if (chValid[0]) Serial.print(chMed[0], 3); else Serial.print("ERR");
-  Serial.print("\tCH3_RAW=");
+  Serial.print("\tCH1_RAW=");
   if (chValid[1]) Serial.print(chMed[1], 3); else Serial.print("ERR");
   Serial.print("\tIDE_RAW=");
   if (ideValid) Serial.print(ideTrue, 3); else Serial.print("ERR");
